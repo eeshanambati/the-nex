@@ -3,6 +3,7 @@ name = "aegismesh-sim"
 description = "AegisMesh simulation harness: silent tap-to-relay delivery and memory wipe, all in memory"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [[bin]]

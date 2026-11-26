@@ -3,6 +3,7 @@ name = "the-nex-core"
 description = "The Nex EDR engine: detectors, quarantine, AI scoring and the Windows/macOS OS layer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [lib]

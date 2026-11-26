@@ -92,8 +92,8 @@ pub fn read_progress(cfg: &AppConfig) -> Option<ScanProgress> {
 
 // ---- service side ------------------------------------------------------------------------
 
-/// Creates the request folder: anyone may add a file, nobody but the service may list or
-/// remove one. Also clears progress left behind by a previous run.
+/// Creates the request folder: anyone may add a file, nobody but the service may remove one
+/// (on Windows users can also list it). Also clears progress left behind by a previous run.
 pub fn prepare(cfg: &AppConfig) -> io::Result<()> {
     let _ = fs::remove_file(cfg.log_dir.join(SCAN_PROGRESS_FILE));
     let dir = request_dir(cfg);
@@ -106,6 +106,15 @@ pub fn prepare(cfg: &AppConfig) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o1733))?;
+    }
+    // The installed service only: run by hand, the folder is already the user's own.
+    #[cfg(windows)]
+    if crate::config::running_privileged() && !crate::platform::let_users_add_files(&dir) {
+        // Without the folder the app knows not to ask (see `available`).
+        fs::remove_dir(&dir)?;
+        return Err(io::Error::other(
+            "could not open the request folder to users",
+        ));
     }
     Ok(())
 }
@@ -334,10 +343,8 @@ impl ScanJobs {
 // ---- client side (desktop app) -----------------------------------------------------------
 
 /// True when the service that owns `cfg`'s data folder accepts scan requests.
-/// shortcut: Unix only. On Windows the folder inherits an admin-only ACL, so the app keeps its
-/// elevation prompt there; grant Users "create files" on it to switch Windows over.
 pub fn available(cfg: &AppConfig) -> bool {
-    cfg!(unix) && request_dir(cfg).is_dir()
+    request_dir(cfg).is_dir()
 }
 
 fn drop_request(cfg: &AppConfig, name: &str) -> Result<(), String> {
@@ -367,7 +374,8 @@ pub fn request_cancel(cfg: &AppConfig) -> Result<(), String> {
     drop_request(cfg, CANCEL_REQUEST)
 }
 
-/// Asks the service for a scan and waits for its report.
+/// Asks the service for a scan and waits for its report: `timeout` without a sign of life, not in
+/// all. A full Downloads folder takes many minutes.
 pub fn request_and_wait(
     cfg: &AppConfig,
     kind: ScanKind,
@@ -433,12 +441,54 @@ mod tests {
     }
 
     #[test]
+    fn a_long_scan_is_waited_for_while_it_moves() {
+        let (root, cfg) = sandbox("long");
+        let (client, step) = (cfg.clone(), Duration::from_millis(300));
+        let waiting = thread::spawn(move || {
+            request_and_wait(&client, ScanKind::Quick, Duration::from_secs(1))
+        });
+        let asked = request_dir(&cfg).join(request_name(ScanKind::Quick));
+        while !asked.exists() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..8 {
+            write_progress(
+                &cfg,
+                &ScanProgress {
+                    kind: ScanKind::Quick,
+                    running: true,
+                    started_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    files_examined: 1,
+                    files_scanned: 1,
+                    findings: 0,
+                    current: String::new(),
+                    scheduled: false,
+                },
+            );
+            thread::sleep(step);
+        }
+        let report = QuickScanReport {
+            finished_at: Utc::now().to_rfc3339(),
+            ..QuickScanReport::default()
+        };
+        let path = cfg.log_dir.join(ScanKind::Quick.report_file());
+        fs::write(path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(
+            waiting.join().unwrap().is_ok(),
+            "over twice the wait for an answer"
+        );
+
+        fs::remove_file(cfg.log_dir.join(SCAN_PROGRESS_FILE)).unwrap();
+        assert!(request_and_wait(&cfg, ScanKind::Quick, step).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_requested_full_scan_runs_reports_and_never_moves_files() {
         let (root, cfg) = sandbox("full");
         let (jobs, shared, scanner, telemetry) = service(&cfg);
-        // The app only hands scans to the service on Unix (see `available`); the service side
-        // below is the same on every OS.
-        assert_eq!(available(&cfg), cfg!(unix));
+        assert!(available(&cfg));
         jobs.poll(&shared, &scanner, &telemetry); // nothing requested: nothing happens
         assert!(read_progress(&cfg).is_none());
 

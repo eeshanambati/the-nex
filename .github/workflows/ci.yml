@@ -177,6 +177,21 @@ jobs:
           while (-not (Test-Path $status) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
           if (-not (Test-Path $status)) { throw "the installed service never wrote $status" }
           Get-Content $status -Raw | ConvertFrom-Json | Format-List version, pid, model_loaded, watched_dirs
+
+          # The app asks the service for scans through this folder: any local user may add a file
+          # to it and nothing more, and the service picks the request up and can be told to stop.
+          $requests = Join-Path $dir 'requests'
+          $acl = icacls $requests
+          $acl
+          $users = $acl | Where-Object { $_ -match '\\Users:' }
+          if (-not ($users -match 'Users:\(WD\)')) { throw 'local users cannot ask the service for a scan' }
+          if ($users -match '\((F|M|W|AD|DC|D|WDAC|WO)\)') { throw 'local users may do more than add a request' }
+          $progress = Join-Path $dir 'logs\scan_progress.json'
+          New-Item -ItemType File (Join-Path $requests 'full-scan') | Out-Null
+          $deadline = (Get-Date).AddSeconds(30)
+          while (-not (Test-Path $progress) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+          if (-not (Test-Path $progress)) { throw 'the service never started the requested full scan' }
+          New-Item -ItemType File (Join-Path $requests 'cancel-scan') -Force | Out-Null
           "installed OK; uninstalling"
 
           # _?= runs the uninstaller in place so -Wait really waits for it.

@@ -502,7 +502,10 @@ fn quarantine_meta_restore_and_delete_round_trip() {
     let resolved = fs::canonicalize(victim.parent().unwrap())
         .unwrap()
         .join(victim.file_name().unwrap());
-    assert_eq!(stored.original_path, resolved);
+    assert_eq!(
+        platform::path_key(&stored.original_path),
+        platform::path_key(&resolved)
+    );
     assert_eq!(
         quarantine::list_quarantined(&cfg).unwrap(),
         vec![meta.clone()]

@@ -3,6 +3,7 @@ name = "aegismesh-gui"
 description = "AegisMesh simulation console (Tauri v2, plain HTML/CSS/JS frontend in ui/aegismesh)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [[bin]]

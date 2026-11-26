@@ -3,6 +3,7 @@ name = "aegismesh-core"
 description = "AegisMesh: silent wearable SOS (tap rhythm, disguised framing, ephemeral crypto, mesh relay). Simulation only."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [lib]

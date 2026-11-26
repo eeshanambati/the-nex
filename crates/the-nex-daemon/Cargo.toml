@@ -3,6 +3,7 @@ name = "the-nex-daemon"
 description = "The Nex background service/daemon, tray and CLI"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 build = "build.rs"
 

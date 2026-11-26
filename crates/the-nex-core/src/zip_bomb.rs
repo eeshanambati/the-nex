@@ -42,6 +42,9 @@ const TIME_BUDGET: Duration = Duration::from_secs(10);
 /// For the zip library to find a directory our own parser could not.
 const OPEN_BUDGET: Duration = Duration::from_secs(2);
 const NESTED_EXTENSIONS: &[&str] = &["zip", "jar", "war", "apk", "xpi"];
+/// A Java program bundles its libraries as jars, which bundle theirs: that many levels more than
+/// the limit, as long as the deepest ones are jars. Size and ratio are checked all the way down.
+const JAR_EXTRA_DEPTH: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZipThreatKind {
@@ -200,7 +203,7 @@ fn inspect_root<R: Read + Seek>(
         deadline: Instant::now() + TIME_BUDGET,
         incomplete: false,
     };
-    let threat = inspect_level(reader, 1, limits, &mut scan);
+    let threat = inspect_level(reader, 1, false, limits, &mut scan);
     let late = Instant::now() > scan.deadline;
     (threat, scan.incomplete || late)
 }
@@ -226,6 +229,7 @@ struct Rec {
     /// Local header start .. end of compressed data, absolute in the file.
     extent: Option<(u64, u64)>,
     nested: bool,
+    jar: bool,
     mismatch: Option<String>,
     /// The entry needs a password: its content cannot be read.
     encrypted: bool,
@@ -270,6 +274,10 @@ fn is_nested_name(name: &[u8]) -> bool {
     NESTED_EXTENSIONS
         .iter()
         .any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
+fn is_jar_name(name: &[u8]) -> bool {
+    name.to_ascii_lowercase().ends_with(b".jar")
 }
 
 struct Pending {
@@ -332,6 +340,7 @@ fn parse_cdfh(cd: &[u8], pos: usize, index: usize) -> Option<(Pending, usize)> {
         uncompressed,
         extent: None,
         nested: !name.ends_with(b"/") && is_nested_name(name),
+        jar: is_jar_name(name),
         mismatch: None,
         encrypted,
     };
@@ -577,6 +586,7 @@ fn lfh_walk<R: Read + Seek>(
             uncompressed,
             extent: Some((pos, end)),
             nested: false,
+            jar: false,
             mismatch: None,
             encrypted: flags & 1 != 0,
         });
@@ -607,6 +617,7 @@ fn crate_recs<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<Rec> {
                 start.saturating_add(entry.compressed_size()),
             )),
             nested: !entry.is_dir() && is_nested_name(entry.name_raw()),
+            jar: is_jar_name(entry.name_raw()),
             mismatch: None,
             encrypted: entry.encrypted(),
         });
@@ -661,6 +672,7 @@ impl<R: Seek> Seek for Timed<R> {
 fn inspect_level<R: Read + Seek>(
     mut reader: R,
     depth: u32,
+    jar: bool,
     limits: &ZipLimits,
     scan: &mut Scan,
 ) -> Option<ZipThreat> {
@@ -731,17 +743,15 @@ fn inspect_level<R: Read + Seek>(
         }
     };
     let entries = recs.len();
-    if depth > limits.max_depth {
+    let max_depth = limits.max_depth + if jar { JAR_EXTRA_DEPTH } else { 0 };
+    if depth > max_depth {
         return Some(ZipThreat {
             kind: ZipThreatKind::NestingDepth,
             depth,
             entries,
             total_compressed: 0,
             total_uncompressed: 0,
-            detail: format!(
-                "archive nested {depth} levels deep exceeds the limit of {}",
-                limits.max_depth
-            ),
+            detail: format!("archive nested {depth} levels deep exceeds the limit of {max_depth}"),
         });
     }
 
@@ -956,7 +966,9 @@ fn inspect_level<R: Read + Seek>(
                 ),
             );
         }
-        if let Some(inner) = inspect_level(Cursor::new(data.as_slice()), depth + 1, limits, scan) {
+        if let Some(inner) =
+            inspect_level(Cursor::new(data.as_slice()), depth + 1, r.jar, limits, scan)
+        {
             return Some(inner);
         }
         // Ratios multiply through nesting: everything unpacked versus the file on disk.
@@ -993,7 +1005,10 @@ fn scan_and_respond_with(
         return None;
     }
     let details = threat.summary();
-    let action = if cfg.is_dry_run() {
+    let restored = quarantine::was_restored(cfg, path, digest);
+    let action = if restored {
+        format!("ALERT_ONLY: {}", quarantine::RESTORED_BY_USER)
+    } else if cfg.is_dry_run() {
         "DRY_RUN: would quarantine".to_string()
     } else {
         match quarantine::quarantine_file(path, cfg, "ZIP_BOMB", &details) {
@@ -1001,17 +1016,16 @@ fn scan_and_respond_with(
             Err(e) => format!("QUARANTINE_FAILED: {e}"),
         }
     };
-    quarantine::record_event(
-        cfg,
-        ThreatEvent::new(
-            "ZIP_BOMB",
-            Severity::High,
-            path.display().to_string(),
-            action,
-            details,
-        )
-        .with_sha256(digest),
-    );
+    let mut event = ThreatEvent::new(
+        "ZIP_BOMB",
+        Severity::High,
+        path.display().to_string(),
+        action,
+        details,
+    )
+    .with_sha256(digest);
+    event.quiet = restored;
+    quarantine::record_event(cfg, event);
     Some(threat)
 }
 
@@ -1305,6 +1319,32 @@ mod tests {
         assert_eq!(threat.depth, 4);
     }
 
+    /// A Minecraft modpack (.mrpack) holds mods (.jar) that bundle libraries (.jar) that bundle
+    /// theirs; one was quarantined on a real PC.
+    #[test]
+    fn jars_inside_jars_are_how_programs_are_packed() {
+        let wrap = |name: &str, inner: Vec<u8>| build_zip(&[(name, inner)]);
+        let jar = wrap("Main.class", b"code".to_vec());
+        let pack = wrap(
+            "mods/a.jar",
+            wrap("jars/b.jar", wrap("jars/c.jar", jar.clone())),
+        );
+        assert_eq!(inspect_zip_bytes(&pack, &ZipLimits::default()), None);
+
+        // Calling the layers .jar buys two levels, not any number, and no zip below the limit.
+        let deep = (0..5).fold(jar.clone(), |inner, _| wrap("x.jar", inner));
+        let zip_below = wrap("a.jar", wrap("b.jar", wrap("c.zip", jar)));
+        for archive in [deep, zip_below] {
+            let threat = inspect_zip_bytes(&archive, &ZipLimits::default()).unwrap();
+            assert_eq!(threat.kind, ZipThreatKind::NestingDepth);
+        }
+        // And a bomb down there is still found.
+        let bomb = build_zip(&[("zeros.bin", vec![0u8; 20 * 1024 * 1024])]);
+        let hidden = wrap("a.jar", wrap("b.jar", wrap("c.jar", bomb)));
+        let threat = inspect_zip_bytes(&hidden, &ZipLimits::default()).unwrap();
+        assert_eq!(threat.kind, ZipThreatKind::CompressionRatio);
+    }
+
     #[test]
     fn expired_deadline_keeps_the_structural_verdict() {
         let bomb = build_zip(&[("zeros.bin", vec![0u8; 2 * 1024 * 1024])]);
@@ -1320,7 +1360,7 @@ mod tests {
             deadline: Instant::now() - Duration::from_secs(1),
             incomplete: false,
         };
-        let threat = inspect_level(Cursor::new(bomb.as_slice()), 1, &limits, &mut scan)
+        let threat = inspect_level(Cursor::new(bomb.as_slice()), 1, false, &limits, &mut scan)
             .expect("ratio verdict survives an expired deadline");
         assert_eq!(threat.kind, ZipThreatKind::CompressionRatio);
     }

@@ -12,6 +12,8 @@ use crate::check_file;
 use crate::config::{self, AppConfig};
 use crate::known_bad::{self, Digest32, Stamp};
 use crate::logger::{self, lock_or_recover};
+#[cfg(windows)]
+use crate::platform;
 use crate::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -369,9 +371,14 @@ impl LiveAllowed {
 
 /// The stamp of the file as it is now (never following a link), for `check`.
 pub fn stamp_of(path: &Path) -> Option<Stamp> {
-    fs::symlink_metadata(path)
-        .ok()
-        .and_then(|m| known_bad::stamp(&m))
+    let meta = fs::symlink_metadata(path).ok()?;
+    // Windows: which file it is (volume and index) and when it last changed in any way, read
+    // from the file itself; size and modified time alone are kept by a same-size swap.
+    #[cfg(windows)]
+    if meta.is_file() {
+        return platform::file_stamp(path).map(Stamp::Strong);
+    }
+    known_bad::stamp(&meta)
 }
 
 /// Hashes `path` (the file about to be flagged) and says whether that exact content is always
@@ -950,6 +957,24 @@ mod tests {
             describe("x\u{202E}.exe", HASH),
             "SHA-256 0123456789abcdef, file name: x.exe"
         );
+    }
+
+    /// What failed on Windows CI: another file of the same size, with the same modified time
+    /// (a coarse clock gives it that, or the swapper sets it), took the judged file's place.
+    #[test]
+    fn a_same_size_file_with_a_forged_time_is_still_another_file() {
+        let dir = temp("forged");
+        let file = dir.join("tool.bin");
+        fs::write(&file, b"judged bytes").unwrap();
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let judged = stamp_of(&file);
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, b"other bytes!").unwrap();
+        let forged = fs::File::options().write(true).open(&file).unwrap();
+        forged.set_modified(modified).unwrap();
+        drop(forged);
+        assert_ne!(stamp_of(&file), judged);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

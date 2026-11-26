@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -144,6 +144,7 @@ fn is_engine_output(cfg: &AppConfig, path: &Path) -> bool {
         crate::config::STATUS_FILE_NAME,
         QUICK_SCAN_REPORT_FILE,
         FULL_SCAN_REPORT_FILE,
+        SCHEDULED_SCAN_REPORT_FILE,
         SCAN_PROGRESS_FILE,
         logger::LOG_FILE_NAME,
     ];
@@ -214,7 +215,7 @@ pub struct ScanLimits {
     pub max_depth: usize,
     pub max_files: u64,
     /// Folders this close to a scan root that cannot be opened are listed in the report
-    /// (0 = only the roots; 2 reaches /Users/<name>/Desktop from /Users)...
+    /// (0 = only the roots; 2 reaches /Users/<name>/Desktop from /Users, 3 from the top of a drive)...
     pub report_unreadable_depth: usize,
     /// ...but below the roots only inside these trees: people's own folders, which Full Disk
     /// Access unlocks. System folders macOS never opens (SIP) would otherwise show up in every
@@ -235,7 +236,7 @@ pub const QUICK_LIMITS: ScanLimits = ScanLimits {
 pub const FULL_LIMITS: ScanLimits = ScanLimits {
     max_depth: 64,
     max_files: 20_000_000,
-    report_unreadable_depth: 2,
+    report_unreadable_depth: if cfg!(windows) { 3 } else { 2 },
     report_unreadable_under: &["/Users", "/home"],
     hash_every_file: false,
 };
@@ -243,20 +244,41 @@ const MAX_UNREADABLE_LISTED: usize = 50;
 
 /// iCloud / File Provider placeholders ("dataless" files and folders): opening one makes macOS
 /// download it, so a scan would pull down the user's whole cloud drive.
-fn is_cloud_placeholder(entry: &fs::DirEntry) -> bool {
-    cfg!(target_os = "macos") && is_dataless(&entry.path())
-}
-
 #[cfg(target_os = "macos")]
-fn is_dataless(path: &Path) -> bool {
+fn is_cloud_placeholder(metadata: &fs::Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
     const SF_DATALESS: u32 = 0x4000_0000;
-    fs::symlink_metadata(path).is_ok_and(|m| m.st_flags() & SF_DATALESS != 0)
+    metadata.st_flags() & SF_DATALESS != 0
 }
 
-#[cfg(not(target_os = "macos"))]
-fn is_dataless(_path: &Path) -> bool {
+/// OneDrive and other Cloud Files placeholders. Only the attribute that the cloud filter itself
+/// keeps counts: a program can set FILE_ATTRIBUTE_OFFLINE on its own file, and RECALL_ON_OPEN has
+/// the value of FILE_ATTRIBUTE_EA, so either would be a way to hide from every scan.
+#[cfg(windows)]
+fn needs_download(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
+}
+
+#[cfg(windows)]
+fn is_cloud_placeholder(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    needs_download(metadata.file_attributes())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn is_cloud_placeholder(_metadata: &fs::Metadata) -> bool {
     false
+}
+
+/// A placeholder every walk leaves alone. On Windows only files: a program can make its own
+/// placeholder folders, and one would otherwise hide everything in it.
+fn not_here_yet(metadata: &fs::Metadata) -> bool {
+    is_cloud_placeholder(metadata) && (metadata.is_file() || cfg!(target_os = "macos"))
+}
+
+fn is_dataless(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| not_here_yet(&m))
 }
 
 /// Inspects one complete file with the enabled engines; detections are acted on and logged.
@@ -318,6 +340,10 @@ pub fn scan_path(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path, teleme
     if should_ignore(cfg, path) || !is_regular_file(path) {
         return;
     }
+    // Windows reports the change when the content arrives, which queues the file again.
+    if cfg!(windows) && fs::symlink_metadata(path).is_ok_and(|m| is_cloud_placeholder(&m)) {
+        return;
+    }
     let kind = classify_file(path);
     let hash = cfg.known_bad_active();
     // Programs and archives are parsed, so they must be complete. Every other file is only
@@ -368,7 +394,7 @@ impl Arrived {
         }
         for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
             let is_link = entry.file_type().map_or(true, |t| t.is_symlink());
-            if !is_link && !is_cloud_placeholder(&entry) {
+            if !is_link && !entry.metadata().is_ok_and(|m| not_here_yet(&m)) {
                 self.push(entry.path());
             }
         }
@@ -401,6 +427,19 @@ pub fn load_known_bad(cfg: &mut AppConfig) {
             );
         }
     }
+}
+
+/// Whatever the drive: the Users folder of C: counts as "/Users" here.
+fn in_reported_tree(limits: &ScanLimits, dir: &Path) -> bool {
+    let mut parts = dir.components();
+    if let Some(Component::Prefix(_)) = dir.components().next() {
+        parts.next();
+    }
+    let dir = parts.as_path();
+    limits
+        .report_unreadable_under
+        .iter()
+        .any(|tree| dir.starts_with(tree))
 }
 
 /// One-shot recursive scan of existing files under `roots` (bounded in depth and file count).
@@ -455,11 +494,7 @@ pub fn scan_tree(
             Ok(entries) => entries,
             Err(e) => {
                 let listed = depth == 0
-                    || (depth <= limits.report_unreadable_depth
-                        && limits
-                            .report_unreadable_under
-                            .iter()
-                            .any(|tree| dir.starts_with(tree)));
+                    || (depth <= limits.report_unreadable_depth && in_reported_tree(limits, &dir));
                 if listed
                     && e.kind() != std::io::ErrorKind::NotFound
                     && report.unreadable.len() < MAX_UNREADABLE_LISTED
@@ -484,7 +519,7 @@ pub fn scan_tree(
             if should_ignore(cfg, &path) {
                 continue;
             }
-            if is_cloud_placeholder(&entry) {
+            if entry.metadata().is_ok_and(|m| not_here_yet(&m)) {
                 report.cloud_skipped += 1;
                 continue;
             }
@@ -1405,6 +1440,145 @@ mod tests {
         set_engine(&cfg, Engine::KnownBad, false);
         let off = scan(&QUICK_LIMITS);
         assert_eq!((off.files_scanned, off.findings.len()), (0, 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_content_windows_would_download_is_left_alone() {
+        const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        // What an online-only OneDrive file reports.
+        assert!(needs_download(
+            RECALL_ON_DATA_ACCESS | 0x1000 | 0x400 | 0x200 | 0x20
+        ));
+        // Any program can set these on its own file, so they must not hide it from a scan:
+        // offline, hidden + system, pinned, unpinned, and "has extended attributes" (the same
+        // value as RECALL_ON_OPEN).
+        for settable in [0x1000, 0x2 | 0x4, 0x8_0000, 0x10_0000, 0x4_0000] {
+            assert!(!needs_download(settable), "{settable:#x}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_marked_offline_by_a_program_is_still_scanned() {
+        let root = temp_root("offline");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let bomb = watch.join("offline.zip");
+        fs::write(&bomb, decoy_bomb()).unwrap();
+        let marked = std::process::Command::new("attrib")
+            .arg("+O")
+            .arg(&bomb)
+            .status();
+        assert!(marked.unwrap().success());
+        let cfg = AppConfig::for_base_dir(&root.join("base"));
+        let telemetry = Telemetry::default();
+        let report = quick_scan(
+            &cfg,
+            &BinaryAiScanner::heuristic_only(),
+            &[watch],
+            &telemetry,
+        );
+        assert_eq!((report.cloud_skipped, report.findings.len()), (0, 1));
+        assert!(!bomb.exists(), "moved to quarantine");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_folder_of_a_person_is_reported_by_a_full_scan() {
+        let people = [r"C:\Users", r"C:\Users\kim\Desktop", r"D:\Users\kim"];
+        for dir in people {
+            assert!(in_reported_tree(&FULL_LIMITS, Path::new(dir)), "{dir}");
+        }
+        for other in [r"C:\Windows\CSC", r"C:\ProgramData\Users"] {
+            assert!(!in_reported_tree(&FULL_LIMITS, Path::new(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn every_report_the_engine_writes_is_its_own_output() {
+        let root = temp_root("own-output");
+        let cfg = AppConfig {
+            log_dir: root.clone(),
+            events_log: root.join("events.jsonl"),
+            ..AppConfig::for_base_dir(&root.join("base"))
+        };
+        for kind in [ScanKind::Quick, ScanKind::Full, ScanKind::Scheduled] {
+            let report = root.join(kind.report_file());
+            assert!(is_engine_output(&cfg, &report), "{kind:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// From a real Windows log: a file restored from quarantine went straight back into it, three
+    /// times, because live protection saw it arrive.
+    #[test]
+    fn a_restored_file_stays_where_it_was_put() {
+        let root = temp_root("restored");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let scanner = BinaryAiScanner::with_fixed_score(0.99);
+        let telemetry = Telemetry::default();
+        let (bomb, program) = (watch.join("decoy.zip"), watch.join("decoy.exe"));
+        fs::write(&bomb, decoy_bomb()).unwrap();
+        fs::write(&program, decoy_program()).unwrap();
+        for (kind, path) in [("ZIP_BOMB", &bomb), ("MALWARE_AI", &program)] {
+            scan_path(&cfg, &scanner, path, &telemetry);
+            let id = events_of(&cfg, kind)[0]
+                .quarantine_id()
+                .unwrap()
+                .to_string();
+            let meta = quarantine::restore_file(&id, &cfg).unwrap();
+            quarantine::record_restore(&cfg, &meta, "");
+            scan_path(&cfg, &scanner, path, &telemetry);
+            let seen = events_of(&cfg, kind);
+            assert!(path.exists(), "{kind}: {seen:?}");
+            assert!(
+                seen[1].action_taken.starts_with("ALERT_ONLY: you restored"),
+                "{seen:?}"
+            );
+            assert!(seen[1].quiet, "its owner has already decided");
+
+            // Another file under that name, and the same file elsewhere, are judged afresh.
+            let copy = path.with_file_name(format!(
+                "copy-{kind}.{}",
+                path.extension().unwrap().to_string_lossy()
+            ));
+            fs::copy(path, &copy).unwrap();
+            scan_path(&cfg, &scanner, &copy, &telemetry);
+            assert!(!copy.exists(), "{kind}");
+            let mut bytes = fs::read(path).unwrap();
+            bytes.push(0);
+            fs::write(path, bytes).unwrap();
+            scan_path(&cfg, &scanner, path, &telemetry);
+            assert!(!path.exists(), "{kind}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A match in the known-malware list is certain: restoring it changes nothing.
+    #[test]
+    fn a_restored_listed_file_is_quarantined_again() {
+        let root = temp_root("restored-known");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let listed = watch.join("payroll.docm");
+        fs::write(&listed, b"harmless decoy").unwrap();
+        let cfg = cfg_with_list(&root, std::slice::from_ref(&listed));
+        let scanner = BinaryAiScanner::heuristic_only();
+        scan_path(&cfg, &scanner, &listed, &Telemetry::default());
+        let id = events_of(&cfg, known_bad::THREAT_TYPE)[0]
+            .quarantine_id()
+            .unwrap()
+            .to_string();
+        let meta = quarantine::restore_file(&id, &cfg).unwrap();
+        quarantine::record_restore(&cfg, &meta, "");
+        scan_path(&cfg, &scanner, &listed, &Telemetry::default());
+        assert!(!listed.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

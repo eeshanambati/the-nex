@@ -848,8 +848,11 @@ pub fn scan_and_respond(
         explanation: &details,
         data_dir: &cfg.base_dir,
     });
+    let restored =
+        action != ai_policy::Action::Ignore && quarantine::was_restored(cfg, path, digest);
     let action = match action {
         ai_policy::Action::Ignore => return None,
+        _ if restored => format!("ALERT_ONLY: {}", quarantine::RESTORED_BY_USER),
         ai_policy::Action::Alert(why) => format!("ALERT_ONLY: {why}"),
         ai_policy::Action::WouldQuarantine | ai_policy::Action::WouldTerminateAndQuarantine => {
             "DRY_RUN: would quarantine".to_string()
@@ -861,17 +864,16 @@ pub fn scan_and_respond(
             }
         }
     };
-    quarantine::record_event(
-        cfg,
-        ThreatEvent::new(
-            "MALWARE_AI",
-            Severity::High,
-            path.display().to_string(),
-            action,
-            details.clone(),
-        )
-        .with_sha256(digest),
-    );
+    let mut event = ThreatEvent::new(
+        "MALWARE_AI",
+        Severity::High,
+        path.display().to_string(),
+        action,
+        details.clone(),
+    )
+    .with_sha256(digest);
+    event.quiet = restored;
+    quarantine::record_event(cfg, event);
     Some(AiOutcome {
         score,
         detection: Some(details),

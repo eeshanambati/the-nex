@@ -331,6 +331,14 @@
                   <button class="btn btn-danger" id="uninstall-service">Uninstall</button>
                 </div>
               </div>
+              <div class="row" id="admin-row" hidden>
+                <div>
+                  <h3>Always open as administrator</h3>
+                  <p class="muted">Windows asks for your approval each time The Nex opens. While it is open, Restore, Delete and Always allow then do not ask again. Dragging a file onto the window does not work in this mode, because Windows blocks it.</p>
+                  <p class="muted" id="admin-state"></p>
+                </div>
+                <button class="switch" id="open-as-admin" role="switch" aria-checked="false" aria-label="Always open as administrator"></button>
+              </div>
               <div class="row wrap">
                 <div>
                   <h3>Scheduled scan</h3>

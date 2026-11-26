@@ -1546,6 +1546,24 @@ function wire() {
   $("uninstall-service").addEventListener("click", () => busy("uninstall-service", "Removing…", async () => {
     notice(await call("uninstall_service"), false);
   }));
+  wireOpenAsAdmin();
+}
+
+/* Windows only: the row stays hidden elsewhere. */
+async function wireOpenAsAdmin() {
+  const button = $("open-as-admin");
+  const show = (choice) => {
+    $("admin-row").hidden = !choice.available;
+    setSwitch(button, choice.on);
+    $("admin-state").textContent = choice.elevated
+      ? "This window is running as administrator."
+      : choice.on ? "Takes effect the next time The Nex opens." : "";
+  };
+  try { show(await call("get_open_as_admin")); } catch { return; }
+  button.addEventListener("click", async () => {
+    try { show(await call("set_open_as_admin", { on: button.getAttribute("aria-checked") !== "true" })); }
+    catch (error) { notice(errorText(error), true); }
+  });
 }
 
 /* ---- Appearance: wallpaper layer + glass theme ------------------------------------------- */

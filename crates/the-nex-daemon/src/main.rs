@@ -116,16 +116,7 @@ fn restore(id: &str, args: &CliArgs) -> ExitCode {
 fn restored(id: &str, result: std::io::Result<QuarantineMeta>, cfg: &AppConfig) -> ExitCode {
     match result {
         Ok(meta) => {
-            quarantine::record_event(
-                cfg,
-                ThreatEvent::new(
-                    "QUARANTINE_RESTORE",
-                    Severity::Low,
-                    meta.original_path.display().to_string(),
-                    "RESTORED",
-                    format!("id={} sha256={}", meta.id, meta.sha256),
-                ),
-            );
+            quarantine::record_restore(cfg, &meta, "");
             println!("Restored {} to {}", meta.id, meta.original_path.display());
             ExitCode::SUCCESS
         }

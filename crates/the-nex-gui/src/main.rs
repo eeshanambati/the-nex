@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod admin;
 mod appearance;
 #[cfg(target_os = "macos")]
 mod camera;
@@ -673,8 +674,7 @@ fn audit(cfg: &AppConfig, threat_type: &str, action: &str, meta: &QuarantineMeta
     );
 }
 
-const CAUGHT_AGAIN: &str =
-    "It can be caught again by the next scan; to keep it, use Restore and always allow instead.";
+const CAUGHT_AGAIN: &str = "It stays there unless it is on the known-malware list. A copy somewhere else can be caught again; to allow it anywhere, use Restore and always allow instead.";
 
 #[tauri::command]
 async fn restore_quarantine(id: String) -> Result<String, String> {
@@ -685,7 +685,7 @@ async fn restore_quarantine(id: String) -> Result<String, String> {
         let cfg = config();
         match quarantine::restore_file(&id, &cfg) {
             Ok(meta) => {
-                audit(&cfg, "QUARANTINE_RESTORE", "RESTORED", &meta);
+                quarantine::record_restore(&cfg, &meta, " via desktop app");
                 Ok(format!(
                     "Restored to {}. {CAUGHT_AGAIN}",
                     meta.original_path.display()
@@ -782,7 +782,7 @@ async fn allow_quarantined(id: String) -> Result<String, String> {
         };
         match direct {
             Ok(meta) => {
-                audit(&cfg, "QUARANTINE_RESTORE", "RESTORED", &meta);
+                quarantine::record_restore(&cfg, &meta, " via desktop app");
                 Ok(format!(
                     "Restored to {}; this exact file will not be flagged again",
                     meta.original_path.display()
@@ -1075,6 +1075,9 @@ async fn aegismesh(op: String, request: serde_json::Value) -> Result<serde_json:
 }
 
 fn main() {
+    if admin::relaunch_if_wanted() {
+        return;
+    }
     let builder = tauri::Builder::default().on_window_event(|_window, _event| {
         #[cfg(target_os = "macos")]
         menubar::on_window_event(_window, _event);
@@ -1124,7 +1127,9 @@ fn main() {
             summary::get_scan_schedule,
             summary::set_scan_schedule,
             summary::save_summary_report,
-            startup::check_startup
+            startup::check_startup,
+            admin::get_open_as_admin,
+            admin::set_open_as_admin
         ])
         .build(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");

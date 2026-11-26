@@ -1344,7 +1344,8 @@ fn check_command(names: &[String], command_line: &str, f: &mut Findings) {
     else {
         return;
     };
-    if process_guard::is_alert_only(pattern) {
+    // Something that starts by itself is not a command a person just ran: one sign is enough.
+    if process_guard::is_alert_only(pattern) && pattern != process_guard::ONE_WEAK_SIGN {
         f.soft.push(format!(
             "The command it runs is one that malware uses, but many installers do too (matched \"{pattern}\")."
         ));

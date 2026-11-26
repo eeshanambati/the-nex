@@ -170,8 +170,10 @@ a process that starts the same program again with other instructions.
 Checked on macOS only: 366 Rust tests, the Node tests and 16 live checks. On
 Windows, GitHub's machines ran the state before never-scan: the live, installer and AI checks
 passed and two unit tests failed on assumptions of their own (corrected since, not rerun);
-never-scan is only type-checked there. The administrator prompts, the real window and dropping a real file were
-not exercised.
+never-scan is only type-checked there. Since then the engine, the command line, the live checks and
+the app window have been run on a real Windows 11 PC; what was found and fixed there is in
+[UPGRADE_LOG.md](UPGRADE_LOG.md). The administrator prompts and the installed service were not
+exercised on that PC.
 
 ## Known-malware list
 
@@ -258,7 +260,7 @@ same Quick Scan took 28.4 s and a 100 MB file 290 ms.
   files.
 - The dashboard and menu bar report the engine as degraded ("no list installed") for as long as
   no list ships.
-- The Windows build is compiled and tested only in CI; the numbers above are macOS only.
+- The numbers above are macOS only.
 
 **Try it** (harmless: the list holds only the hash of a file you choose):
 
